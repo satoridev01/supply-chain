@@ -1,0 +1,57 @@
+# =============================================================================
+# Supply-Chain Scanner Test File
+# =============================================================================
+# This file contains a mix of LEGITIMATE and KNOWN-MALICIOUS (typosquat)
+# packages for testing supply-chain security scanners.
+#
+# ⚠️  DO NOT run `pip install -r requirements.txt` on this file!
+#     It is intended for STATIC ANALYSIS / SCANNER TESTING ONLY.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# LEGITIMATE packages (should NOT be flagged)
+# -----------------------------------------------------------------------------
+requests==2.31.0
+colorama==0.4.6
+python-dateutil==2.8.2
+jellyfish==1.0.1
+beautifulsoup4==4.12.2
+urllib3==2.1.0
+flask==3.0.0
+numpy==1.26.2
+setuptools==69.0.2
+lodash==0.0.2
+
+# -----------------------------------------------------------------------------
+# KNOWN TYPOSQUAT / MALICIOUS packages (SHOULD be flagged)
+# -----------------------------------------------------------------------------
+
+# Typosquat of "python-dateutil" — credential stealer (removed from PyPI)
+python3-dateutil==1.0.0
+
+# Typosquat of "jellyfish" using uppercase I instead of lowercase L
+jeIlyfish==0.9.0
+
+# Typosquat of "colorama"
+colourama==0.1.0
+
+# Typosquat of "requests"
+requesocks==0.1.0
+
+# Typosquat of "beautifulsoup4"
+beautifulsup==0.1.0
+
+# Typosquat of "urllib3"
+urlib3==0.1.0
+
+# Typosquat of "flask"
+flaask==0.1.0
+
+# Dependency confusion / namespace confusion patterns
+python-requests==0.1.0
+
+# Typosquat of "setuptools"
+setuptool==0.1.0
+
+# Typosquat of "numpy"
+numppy==0.1.0
