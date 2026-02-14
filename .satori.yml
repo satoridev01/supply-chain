@@ -1,0 +1,7 @@
+settings:
+  name: Supply Chain
+  image: python
+  example: satori run ./ --output
+
+test:
+  - python3 scanner.py -n 10
