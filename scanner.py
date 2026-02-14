@@ -328,6 +328,24 @@ MALWARE_PATTERNS: list[tuple[str, re.Pattern, str, int]] = [
         "Crypto mining pool connection",
         30,
     ),
+    # ── Tier 1b — shell-based obfuscation / dropper chains (weight 50) ──
+    (
+        "b64_echo_decode",
+        re.compile(
+            r"echo\s+['\"]?[A-Za-z0-9+/=]{20,}['\"]?\s*\|\s*base64\s+(?:-[dD]|--decode)"
+        ),
+        "echo base64 → decode (runtime deobfuscation)",
+        50,
+    ),
+    (
+        "curl_pipe_shell",
+        re.compile(
+            r"curl\b.{0,200}\|\s*(?:sh|bash|zsh|dash|ksh)\b"
+            r"|\bwget\b.{0,200}\|\s*(?:sh|bash|zsh|dash|ksh)\b"
+        ),
+        "curl/wget piped to shell (download & execute)",
+        50,
+    ),
     # ── Tier 4 — lower signal, context-dependent (weight 20) ──
     (
         "github_raw_exec",
@@ -896,7 +914,17 @@ _URL_PATTERNS_SKIP_IN_STRINGS = {
     "exfil_webhook", "exfil_pipedream", "exfil_requestbin",
     "onion_url", "ngrok_tunnel", "exfil_transfer",
     "slack_webhook", "pastebin_raw", "exfil_interactsh",
+    "curl_pipe_shell", "b64_echo_decode",
 }
+# Patterns that appear in security-tool detection rules (re.compile, blocklists)
+# should be skipped when the surrounding line is clearly defining a regex or
+# listing forbidden commands rather than executing them.
+_SKIP_IN_DETECTION_CONTEXT = {"curl_pipe_shell", "b64_echo_decode"}
+_DETECTION_CONTEXT_RE = re.compile(
+    r"re\.(?:compile|search|match|findall|finditer|sub)\s*\("
+    r"|re\.IGNORECASE"
+    r"|(?:forbidden|block|banned|dangerous|disallowed|unsafe|deny)[_\s\"']"
+)
 _C2_PATTERN_IDS = {
     "discord_webhook", "telegram_bot",
     "exfil_webhook", "exfil_pipedream", "exfil_requestbin",
@@ -993,11 +1021,34 @@ def _scan_python_source(filename: str, source: str, pkg_name: str = "") -> list[
                     continue
 
             line_no = source[:m.start()].count("\n") + 1
-            # Capture the full source line for context
+            # Capture context: the match line plus continuation lines
+            # (up to 3 extra lines when parens/brackets are still open)
             line_end = source.find("\n", m.end())
             if line_end == -1:
                 line_end = len(source)
             context = source[line_start:line_end].strip()
+            # Extend context through continuation lines (open parens/brackets)
+            open_count = context.count("(") - context.count(")") + \
+                         context.count("[") - context.count("]")
+            pos = line_end
+            extra_lines = 0
+            while open_count > 0 and extra_lines < 3 and pos < len(source):
+                next_end = source.find("\n", pos + 1)
+                if next_end == -1:
+                    next_end = len(source)
+                next_line = source[pos + 1:next_end].strip()
+                context += " " + next_line
+                open_count += next_line.count("(") - next_line.count(")")
+                open_count += next_line.count("[") - next_line.count("]")
+                pos = next_end
+                extra_lines += 1
+
+            # Skip patterns that appear in security-tool detection rules:
+            # e.g. re.compile(r"curl.*|sh"), forbidden_patterns = ["curl|sh"]
+            if pattern_id in _SKIP_IN_DETECTION_CONTEXT:
+                full_line = source[line_start:line_end]
+                if _DETECTION_CONTEXT_RE.search(full_line):
+                    continue
             context = re.sub(r"\s+", " ", context)
 
             # Skip version-reading exec/eval in setup.py
@@ -1280,15 +1331,30 @@ async def fetch_new_pypi_via_changelog(
         # so we must iterate until we reach current_serial.
         BATCH_LIMIT = 50_000
         MAX_BATCHES = 200  # safety cap
+        serial_range = current_serial - since_serial
+        est_batches = min(MAX_BATCHES, max(1, (serial_range + BATCH_LIMIT - 1) // BATCH_LIMIT))
+        print(f"  Serial range: {since_serial}→{current_serial} (~{est_batches} batches)")
+
         total_fetched = 0
         batch_serial = since_serial
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=hours)
         seen: dict[str, dict] = {}  # normalized name → entry dict
+        is_tty = sys.stderr.isatty()
 
         for batch_num in range(1, MAX_BATCHES + 1):
             if batch_serial >= current_serial:
                 break
+
+            # Progress indicator (inline update on TTY, periodic on pipe)
+            pct = min(100, int((batch_serial - since_serial) / max(1, serial_range) * 100))
+            if is_tty:
+                print(f"\r  Fetching batch {batch_num}/{est_batches} ({pct}%) — "
+                      f"{total_fetched} entries, {len(seen)} packages ...", end="", flush=True)
+            elif batch_num % 20 == 0:
+                print(f"  ... batch {batch_num}/{est_batches} ({pct}%) — "
+                      f"{total_fetched} entries, {len(seen)} packages")
+
             entries = await loop.run_in_executor(
                 None, proxy.changelog_since_serial, batch_serial
             )
@@ -1326,10 +1392,9 @@ async def fetch_new_pypi_via_changelog(
             if len(entries) < BATCH_LIMIT:
                 break  # final (partial) batch
 
-            if batch_num % 20 == 0:
-                print(f"  ... fetched {total_fetched} entries so far ({len(seen)} packages found, batch {batch_num})")
-
-        print(f"  XML-RPC returned {total_fetched} changelog entries over {batch_num} batch(es) (serial {since_serial}→{current_serial})")
+        if is_tty:
+            print()  # newline after \r progress
+        print(f"  Fetched {total_fetched} entries in {batch_num} batch(es)")
 
         combined = list(seen.values())
         creates = sum(1 for p in combined if p["source"] == "create")
@@ -1456,9 +1521,9 @@ async def scan_new_pypi_packages(
             entry["risk"] = "HIGH"
         elif typosquat_match and has_strong_signal:
             entry["risk"] = "HIGH"
-        elif entry["score"] >= NEW_PKG_RISK_HIGH:
+        elif has_strong_signal and entry["score"] >= NEW_PKG_RISK_MEDIUM:
             entry["risk"] = "MEDIUM"
-        elif entry["score"] >= NEW_PKG_RISK_MEDIUM:
+        elif typosquat_match and entry["score"] >= NEW_PKG_RISK_MEDIUM:
             entry["risk"] = "MEDIUM"
         else:
             entry["risk"] = "INFO"
@@ -1466,6 +1531,7 @@ async def scan_new_pypi_packages(
         if entry["risk"] in ("HIGH", "MEDIUM"):
             flagged.append(entry)
 
+    flagged.sort(key=lambda x: -x["score"])
     high = sum(1 for f in flagged if f["risk"] == "HIGH")
     med = sum(1 for f in flagged if f["risk"] == "MEDIUM")
     print(f"  Flagged: {len(flagged)} (HIGH: {high}, MEDIUM: {med})")

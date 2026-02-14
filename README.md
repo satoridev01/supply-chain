@@ -27,15 +27,16 @@ The scanner has two independent analysis tracks controlled by `--mode`:
 - Python 3.11+
 - `aiohttp`
 - `python-Levenshtein`
+- `stdlib-list`
 
 ```
-pip install aiohttp python-Levenshtein
+pip install aiohttp python-Levenshtein stdlib-list
 ```
 
 ## Usage
 
 ```bash
-# Default: full scan (both tracks), 10,000 repos
+# Default: full scan (both tracks), 10,000 repos, 24h changelog
 python scanner.py
 
 # Scan 100 repos (faster, for testing)
@@ -47,12 +48,31 @@ python scanner.py --mode github -n 100
 # PyPI new-package analysis only (skip GH Archive)
 python scanner.py --mode pypi --changelog-hours 1
 
+# Last 6 hours of new PyPI packages
+python scanner.py --mode pypi --changelog-hours 6
+
+# Wider source scan (all non-top-PyPI packages, not just recent)
+python scanner.py --scan-depth wide
+
+# Narrow scan (only freq==1 + typosquats)
+python scanner.py --scan-depth narrow -n 100
+
 # Disable colored output
 python scanner.py --no-color
 
 # Piped output auto-disables colors
 python scanner.py | less
 ```
+
+### CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-n`, `--repos` | 10000 | Number of GitHub repos to scan (Track A only) |
+| `--mode` | `both` | `github` = Track A only, `pypi` = Track B only, `both` = full scan |
+| `--changelog-hours` | 24 | Hours of PyPI changelog to fetch (Track B only) |
+| `--scan-depth` | `normal` | `narrow` = freq==1 + typosquats, `normal` = add recent freq>=2, `wide` = all non-top-PyPI |
+| `--no-color` | off | Disable ANSI colored output |
 
 ## Report sections
 
@@ -65,7 +85,7 @@ python scanner.py | less
 ### MEDIUM RISK
 
 - **[SOURCE SCAN]** — Source code scored above the MEDIUM threshold but below HIGH.
-- **[NEW PYPI]** — New package with moderate malware score.
+- **[NEW PYPI]** — New package with moderate malware score and at least one strong signal (weight >= 30), or a typosquat match with score >= 40.
 
 ### LOW / INFO
 
@@ -75,21 +95,71 @@ python scanner.py | less
 
 The scanner looks for these patterns in Python source, weighted by severity:
 
-| Weight | Pattern | Description |
-|--------|---------|-------------|
-| 50 | `discord_webhook`, `telegram_bot` | C2 callback URLs |
-| 50 | `base64_exec` | base64 decode chained to exec/eval |
-| 50 | `browser_data` | Browser cookie/password file access |
-| 40 | `cmdclass_setup`, `install_class` | setup.py install-time code execution |
-| 40 | `fromhex_exec`, `reverse_exec` | Obfuscated exec chains |
-| 40 | `anti_vm` | VM/sandbox detection evasion |
-| 30 | `aws_secret` | AWS credential harvesting |
-| 30 | `credential_path` | SSH/GPG/netrc file access |
-| 25 | `shell_cmd` | Shell command strings (powershell, cmd.exe, bash -c) |
-| 20 | `bare_exec`, `bare_eval` | Unqualified exec()/eval() calls |
-| 15 | `subprocess`, `requests_post` | Subprocess calls, HTTP POST |
+**Tier 1 — C2 / exfiltration endpoints (weight 50):**
 
-Weights are multiplied by file location: **3x** in `setup.py`, **2x** in `__init__.py`, **1x** elsewhere. Matches inside comments and test/example directories are skipped.
+| Pattern | Description |
+|---------|-------------|
+| `discord_webhook` | Discord webhook URL |
+| `telegram_bot` | Telegram bot API URL |
+| `exfil_webhook` | webhook.site exfiltration endpoint |
+| `exfil_pipedream` | Pipedream exfil endpoint |
+| `exfil_requestbin` | RequestBin data capture |
+| `onion_url` | Tor .onion domain |
+| `base64_exec` | base64 decode chained to exec/eval |
+| `b64_echo_decode` | `echo <base64> \| base64 -D` runtime deobfuscation |
+| `curl_pipe_shell` | `curl/wget` piped to `sh/bash/zsh` |
+| `browser_data` | Browser cookie/password file access |
+
+**Tier 2 — Install-time attacks, obfuscation, tunneling (weight 40):**
+
+| Pattern | Description |
+|---------|-------------|
+| `cmdclass_setup` | `cmdclass=` overrides install/develop in setup.py |
+| `install_class` | Custom install command class |
+| `fromhex_exec` | `bytes.fromhex` chained to exec/eval |
+| `reverse_exec` | Reversed string chained to exec/eval |
+| `anti_vm` | VM/sandbox detection evasion |
+| `ngrok_tunnel` | ngrok tunnel (common C2 relay) |
+| `exfil_transfer` | transfer.sh file exfiltration |
+| `slack_webhook` | Slack incoming webhook |
+| `raw_ip_url` | Hard-coded IP URL (C2 beacon) |
+
+**Tier 3 — Credential access, suspicious URLs (weight 30):**
+
+| Pattern | Description |
+|---------|-------------|
+| `aws_secret` | AWS credential harvesting via `os.environ` |
+| `credential_path` | SSH/GPG/netrc/aws file access |
+| `pastebin_raw` | Pastebin raw URL (payload fetch) |
+| `exfil_interactsh` | Interactsh/OAST callback |
+| `crypto_mining` | Crypto mining pool connection |
+
+**Tier 4 — Shell, exec, subprocess (weight 20-25):**
+
+| Pattern | Weight | Description |
+|---------|--------|-------------|
+| `shell_cmd` | 25 | Shell command strings (powershell, cmd.exe, bash -c) |
+| `bare_exec` | 20 | Unqualified `exec()` call |
+| `bare_eval` | 20 | Unqualified `eval()` call |
+| `github_raw_exec` | 20 | GitHub raw content fetched into exec/eval |
+
+**Tier 5 — Low-weight signals (weight 15):**
+
+| Pattern | Description |
+|---------|-------------|
+| `subprocess` | `subprocess.run/Popen/call`, `os.system/popen` |
+| `requests_post` | `requests.post()` call |
+
+### Weight multipliers
+
+Weights are multiplied by file location: **3x** in `setup.py`/`setup.cfg`, **2x** in `__init__.py`, **1x** elsewhere. Matches inside comments and test/example directories are skipped.
+
+### Skip rules
+
+- Code-construct patterns (`bare_exec`, `subprocess`, etc.) are skipped when they appear inside strings
+- C2/URL patterns (`exfil_webhook`, `curl_pipe_shell`, etc.) are skipped inside triple-quoted strings (docstrings, help text)
+- `curl_pipe_shell` and `b64_echo_decode` are skipped when the line contains detection context (`re.compile`, `forbidden`, `blocked`, etc.)
+- Private/loopback IPs (127.x, 10.x, 192.168.x, etc.) are excluded from `raw_ip_url`
 
 ## Risk scoring
 
@@ -97,9 +167,11 @@ For **repo-sourced packages** (found in GitHub dependency files):
 - HIGH: score >= 200
 - MEDIUM: score >= 100
 
-For **new PyPI packages** (from RSS feed):
-- HIGH: score >= 100 with at least one strong signal (weight >= 30)
-- MEDIUM: score >= 40
+For **new PyPI packages** (from changelog):
+- HIGH: score >= 100 with at least one strong signal (weight >= 30), or typosquat + strong signal
+- MEDIUM: score >= 40 with at least one strong signal (weight >= 30), or typosquat + score >= 40
+
+A "strong signal" is any pattern with base weight >= 30 (Tier 1-2). This prevents packages that only accumulate low-weight `subprocess`/`requests_post` hits from being flagged.
 
 Typosquat matches alone are not flagged — they only matter when combined with actual malware signals.
 
